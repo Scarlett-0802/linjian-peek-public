@@ -1,0 +1,4 @@
+# body-parser 1.x pins an affected qs minor. Keep the compatible security fix
+# until its upstream range includes it (GHSA-4mjr-xmp4-gh2g, GHSA-x5fp-wj9c-mxmx).
+overrides:
+  qs: 6.16.0
