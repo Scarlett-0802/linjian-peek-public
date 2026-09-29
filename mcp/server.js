@@ -1,7 +1,7 @@
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { installConfiguredAuth } from "./auth.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
@@ -2206,34 +2206,13 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "32mb" }));
-app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 unified MCP is running. Use /mcp for Streamable HTTP, or /sse for SSE."));
+app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 private MCP. OAuth required at /mcp."));
 app.get("/health", (_req, res) => res.json({
   ok: true,
-  service: "linjian-public-mcp",
-  version: "0.3.9.0",
-  has_url: Boolean(LINJIAN_URL_CANDIDATES.length),
-  has_token: Boolean(LINJIAN_TOKEN),
-  configured_linjian_url: RAW_LINJIAN_URL || "",
-  effective_linjian_url: effectiveLinjianUrl(),
-  fallback_linjian_urls: LINJIAN_URL_CANDIDATES.filter((u) => u !== RAW_LINJIAN_URL),
-  guardian_day_tools: true,
-  diary_tools: true,
-  diary_rename_fix: true,
-  diary_write_fallback: true,
-  diary_storage: "phone_local",
-  diary_annotation_tools: true,
-  diary_annotation_ui: "margin_notes",
-  focus_tools: true,
-  focus_tool_names: ["get_focus_status", "start_focus_mode", "end_focus_mode", "set_focus_plan", "reply_focus_request", "approve_focus_unlock", "deny_focus_unlock"],
-  mcp_wallet_endpoint: "/mcp-wallet",
-  schema_exposure_fix: true,
-  focus_schema_exposure_fix: true,
-  priority_tool: "wallet_takeout_action",
-  wallet_takeout_tool_count: WALLET_TAKEOUT_ACTIONS.size,
-  wallet_takeout_tools: Array.from(WALLET_TAKEOUT_ACTIONS),
-  stability_note: "v0.3.9.0 同步公开版版本信息；普通 /mcp 提前注册统一入口，新增 /mcp-wallet 专用端点，并把专注模式工具前置注册，兼容部分客户端不暴露新增工具的问题。"
+  service: "linjian-private-mcp"
 }));
+installConfiguredAuth(app);
+app.use(express.json({ limit: "32mb" }));
 
 // Some third-party MCP clients send non-standard experimental capability flags during
 // initialize (for example params.capabilities.experimental.ovoActivityCards).  Older
@@ -2265,8 +2244,8 @@ app.post("/mcp", async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, body);
   } catch (err) {
-    console.error(err);
-    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null });
+    console.error("MCP request failed");
+    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "MCP request failed" }, id: null });
   }
 });
 app.get("/mcp", (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp for Streamable HTTP MCP." }));
@@ -2279,19 +2258,14 @@ app.post("/mcp-wallet", async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, body);
   } catch (err) {
-    console.error(err);
-    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null });
+    console.error("MCP request failed");
+    if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "MCP request failed" }, id: null });
   }
 });
 app.get("/mcp-wallet", (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp-wallet for wallet/takeout Streamable HTTP MCP.", endpoint: "/mcp-wallet" }));
-const sseTransports = new Map();
-app.get("/sse", async (_req, res) => {
-  try { const transport = new SSEServerTransport("/messages", res); sseTransports.set(transport.sessionId, transport); res.on("close", () => { sseTransports.delete(transport.sessionId); transport.close(); }); await makeServer().connect(transport); }
-  catch (err) { console.error(err); if (!res.headersSent) res.status(500).end(String(err?.message || err)); }
+app.use((_error, _req, res, _next) => {
+  if (!res.headersSent) res.status(400).json({ error: "request_rejected" });
 });
-app.post("/messages", async (req, res) => { const sessionId = req.query.sessionId; const transport = sseTransports.get(sessionId); if (!transport) return res.status(404).send("No SSE transport for sessionId"); await transport.handlePostMessage(req, res, req.body); });
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`掌心窗 unified MCP listening on 0.0.0.0:${PORT}`);
-  console.log(`LINJIAN_URL=${RAW_LINJIAN_URL || "<missing>"}`);
-  if (LINJIAN_URL_CANDIDATES.length > 1) console.log(`LINJIAN_URL fallback candidates=${LINJIAN_URL_CANDIDATES.join(", ")}`);
 });

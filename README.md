@@ -1,5 +1,7 @@
 # 掌心窗公开版 v0.3.9.0
 
+> **此分支的私有 MCP 安全修复：** Node MCP 现要求单用户 OAuth，旧 `/sse`、`/messages` 已关闭。Render 部署需配置 OAuth Secret 与精确回调地址；`/health` 只报告存活，不再公开详细配置。请先阅读 [OAuth 部署与 ChatGPT 连接说明](docs/mcp-oauth.md)，其中认证步骤取代下文旧版匿名 MCP、SSE 和本地 MCP 启动说明。Android 和 Python Server 协议不变。
+
 ## v0.3.9.0 MCP 兼容与日记批注读取修复
 
 - 修复部分 AI 平台连接 MCP 时因 `params.capabilities.experimental.ovoActivityCards` 触发 `Invalid input` 的兼容问题。
