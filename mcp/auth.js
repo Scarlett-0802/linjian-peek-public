@@ -134,7 +134,10 @@ export function installAuth(app, config) {
     const nonce = randomBytes(32).toString('base64url');
     csrf.set(details.uid, { nonce, expires: Date.now() + 300000 });
     const login = details.prompt.name === 'login';
-    res.type('html').send(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>掌心窗授权</title>
+    // no-referrer makes browsers send Origin: null on native form POSTs.
+    // Keep same-origin form origins while suppressing cross-origin referrers.
+    // The strict Origin comparison and one-time CSRF nonce below remain required.
+    res.set('Referrer-Policy', 'same-origin').type('html').send(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>掌心窗授权</title>
       <h1>允许 ChatGPT 访问你的掌心窗？</h1><p>授权后可读取手机屏幕与状态、点击、输入及使用掌心窗工具。仅为你自己的 ChatGPT 连接授权。</p>
       <form method="post" action="/interaction/${escape(details.uid)}"><input type="hidden" name="csrf" value="${nonce}">
       ${login ? '<label>掌心窗专用登录密钥（不是手机 Token）<input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>' : '<p>你已登录为设备主人。</p>'}

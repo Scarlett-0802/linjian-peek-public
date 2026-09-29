@@ -15,7 +15,8 @@ import { createOAuthStore } from '../oauth-store.js';
 const secret = () => randomBytes(32).toString('base64url');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const key = { ...privateKey.export({ format: 'jwk' }), kid: 'ephemeral-test-key', use: 'sig', alg: 'RS256' };
-const issuer = 'https://mcp.example.test';
+// This is only a logical origin: every request is sent to the local test server.
+const issuer = 'https://zhangxinchuang-mcp-74l0.onrender.com';
 const resource = `${issuer}/mcp`;
 const redirectUri = 'https://chatgpt.com/connector_platform_oauth_redirect';
 const temp = mkdtempSync(path.join(os.tmpdir(), 'palm-oauth-test-'));
@@ -45,7 +46,7 @@ function browser(targetBase = () => base) {
   return async (url, init = {}) => {
     const logical = new URL(url, issuer);
     assert.equal(logical.origin, issuer, 'Tests must never call an external service');
-    const headers = { host: 'mcp.example.test', 'x-forwarded-proto': 'https', ...init.headers };
+    const headers = { host: new URL(issuer).host, 'x-forwarded-proto': 'https', ...init.headers };
     const cookie = [...cookies].filter(([, c]) => logical.pathname.startsWith(c.path)).map(([name, c]) => `${name}=${c.value}`).join('; ');
     if (cookie) headers.cookie = cookie;
     const response = await new Promise((resolve, reject) => {
@@ -81,6 +82,8 @@ async function authorize(request = browser()) {
   for (let i = 0; i < 12; i++) {
     let response = await request(url);
     if (response.status === 200) {
+      assert.equal(response.headers.get('referrer-policy'), 'same-origin',
+        'Native form POST must retain its HTTPS Origin; no-referrer produces Origin: null');
       const html = await response.text();
       const csrf = html.match(/name="csrf" value="([^"]+)"/)?.[1];
       assert.ok(csrf, 'Expected an authorization form');
@@ -133,6 +136,51 @@ test('discovery advertises code + S256, exact resource and no public registratio
   assert.equal(discovery.authorization_response_iss_parameter_supported, true);
   assert.equal(discovery.registration_endpoint, undefined);
   assert.ok(discovery.token_endpoint_auth_methods_supported.includes('client_secret_post'));
+});
+
+test('Render URL fallback is canonical; explicit public URL takes precedence', () => {
+  assert.equal(readAuthConfig({ ...env, MCP_PUBLIC_URL: '', RENDER_EXTERNAL_URL: issuer + '/' }).issuer, issuer);
+  assert.equal(readAuthConfig({ ...env, RENDER_EXTERNAL_URL: 'https://other.example.test' }).issuer, issuer);
+});
+
+test('proxy headers cannot replace the canonical HTTPS host or issuer', async () => {
+  const request = browser();
+  for (const headers of [ { 'x-forwarded-proto': 'http' }, { 'x-forwarded-proto': '' },
+    { host: 'evil.test', 'x-forwarded-host': new URL(issuer).host } ]) {
+    assert.equal((await request('/.well-known/oauth-authorization-server', { headers })).status, 400);
+  }
+  const response = await request('/.well-known/oauth-authorization-server', {
+    headers: { 'x-forwarded-host': 'evil.test', forwarded: 'host=evil.test;proto=http' },
+  });
+  assert.equal(response.status, 200);
+  const metadata = await response.json();
+  assert.equal(metadata.issuer, issuer);
+  assert.equal(new URL(metadata.authorization_endpoint).origin, issuer);
+  assert.equal(new URL(metadata.token_endpoint).origin, issuer);
+});
+
+test('native form policy preserves origin; missing/null/cross-site origins fail even with a valid nonce', async () => {
+  const request = browser(); const { params } = authParams();
+  const start = await request(`/auth?${new URLSearchParams(params)}`);
+  const url = start.headers.get('location'); const page = await request(url);
+  assert.equal(page.headers.get('referrer-policy'), 'same-origin');
+  const csrf = (await page.text()).match(/name="csrf" value="([^"]+)"/)[1];
+  for (const origin of [undefined, 'null', 'https://evil.test', issuer + '.evil.test',
+    issuer.replace('https:', 'http:'), issuer + '/', issuer + ', https://evil.test']) {
+    const init = form({ csrf, password: env.MCP_OWNER_SECRET, decision: 'allow' });
+    init.headers['x-forwarded-for'] = '192.0.2.10';
+    init.headers['x-forwarded-host'] = new URL(issuer).host;
+    init.headers.referer = issuer + url;
+    if (origin === undefined) delete init.headers.origin;
+    else init.headers.origin = origin;
+    const response = await request(url, init);
+    assert.equal(response.status, 403);
+    assert.equal(await response.text(), 'Invalid form origin');
+  }
+  // Rejected origins must not consume the real owner's valid form nonce.
+  const valid = form({ csrf, password: env.MCP_OWNER_SECRET, decision: 'allow' });
+  valid.headers['x-forwarded-for'] = '192.0.2.10';
+  assert.equal((await request(url, valid)).status, 303);
 });
 test('every MCP route rejects anonymous, backend token and query token access', async () => {
   const request = browser();
