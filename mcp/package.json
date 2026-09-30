@@ -13,6 +13,7 @@
     "node": ">=24.0.0 <25"
   },
   "dependencies": {
+    "@libsql/client": "0.18.0",
     "@modelcontextprotocol/sdk": "^1.17.4",
     "express": "^4.22.3",
     "express-rate-limit": "8.7.0",

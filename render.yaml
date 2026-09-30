@@ -44,6 +44,10 @@ services:
         value: 24.19.0
       - key: NODE_ENV
         value: production
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       # 以下 Secret 仅属于 MCP；不放入与 Python Server 共享的环境变量组。
       - key: MCP_OWNER_SECRET
         generateValue: true
