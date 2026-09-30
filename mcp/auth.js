@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createOAuthStore } from './oauth-store.js';
 
 export const MCP_SCOPE = 'phone:control';
+export const AUTHORIZATION_TTL = 90 * 24 * 60 * 60;
 const OWNER = 'owner';
 const CLIENT_ID = 'zhangxinchuang-chatgpt';
 const digest = (value) => createHash('sha256').update(value).digest();
@@ -37,6 +38,9 @@ export function readAuthConfig(env = process.env) {
   const jwks = JSON.parse(env.MCP_OAUTH_JWKS || '{}');
   if (!Array.isArray(jwks.keys) || !jwks.keys.length || jwks.keys.some((key) => !key.d || !key.kid)) {
     throw new Error('Configure a private signing JWKS');
+  }
+  if (env.RENDER === 'true' && (!env.MCP_OAUTH_DB_PATH || !path.isAbsolute(env.MCP_OAUTH_DB_PATH) || env.MCP_OAUTH_DB_PATH === ':memory:')) {
+    throw new Error('Render requires an absolute OAuth database path on a persistent disk');
   }
   return { issuer: issuer.origin, ownerSecret, cookieSecret, clientSecret, redirectUris, jwks,
     storePath: env.MCP_OAUTH_DB_PATH || path.join(process.cwd(), '.oauth-state', 'oauth.sqlite') };
@@ -75,8 +79,15 @@ export function installAuth(app, config) {
           return { scope: MCP_SCOPE, audience: resource, accessTokenTTL: 600, accessTokenFormat: 'opaque' };
         } },
     },
-    ttl: { AuthorizationCode: 60, AccessToken: 600, Interaction: 300, Session: 3600, Grant: 86400, RefreshToken: 86400 },
+    ttl: { AuthorizationCode: 60, AccessToken: 600, Interaction: 300, Session: 3600,
+      Grant: AUTHORIZATION_TTL,
+      // Rotation must not extend the original authorization's absolute lifetime.
+      RefreshToken: (ctx, token) => Math.max(0, Math.min(AUTHORIZATION_TTL - token.totalLifetime(),
+        ctx.oidc.entities.Grant.remainingTTL)) },
     issueRefreshToken: (_ctx, client) => client.grantTypeAllowed('refresh_token'),
+    // Explicit owner consent authorizes this private client beyond the browser login.
+    // oidc-provider 9.12.2 otherwise binds phone:control tokens to the login session.
+    expiresWithSession: (_ctx, source) => source.clientId !== CLIENT_ID,
     rotateRefreshToken: true,
     findAccount: (_ctx, id) => id === OWNER ? { accountId: OWNER, claims: () => ({ sub: OWNER }) } : undefined,
     interactions: { url: (_ctx, interaction) => `/interaction/${interaction.uid}` },
@@ -125,9 +136,21 @@ export function installAuth(app, config) {
   const ownerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, skipSuccessfulRequests: true, keyGenerator: () => OWNER,
     standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'too_many_login_attempts' } });
   const csrf = new Map();
+  const restartAuthorization = (res, status = 400) => res.status(status).type('html').send(
+    '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>请重新授权</title>' +
+    '<h1>授权页面已失效</h1><p>页面已过期、浏览器会话不匹配或服务刚刚重启。' +
+    '请关闭此页，返回 ChatGPT 重新发起掌心窗连接授权。不要重复提交旧表单。</p></html>');
+  const interactionRoute = (fn) => wrap(async (req, res) => {
+    try { await fn(req, res); }
+    catch (error) {
+      if (error instanceof errors.SessionNotFound) return restartAuthorization(res);
+      throw error;
+    }
+  });
   const prune = () => { for (const [key, value] of csrf) if (value.expires < Date.now()) csrf.delete(key); };
-  app.get('/interaction/:uid', wrap(async (req, res) => {
+  app.get('/interaction/:uid', interactionRoute(async (req, res) => {
     const details = await provider.interactionDetails(req, res);
+    if (details.uid !== req.params.uid) return restartAuthorization(res);
     if (!['login', 'consent'].includes(details.prompt.name)) return res.status(400).send('Unsupported authorization request');
     prune();
     if (csrf.size >= 1000) return res.status(503).send('Please try again later');
@@ -143,11 +166,12 @@ export function installAuth(app, config) {
       ${login ? '<label>掌心窗专用登录密钥（不是手机 Token）<input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>' : '<p>你已登录为设备主人。</p>'}
       <button name="decision" value="allow">${login ? '登录并继续' : '允许访问'}</button><button name="decision" value="deny" formnovalidate>取消</button></form></html>`);
   }));
-  app.post('/interaction/:uid', loginLimiter, ownerLimiter, express.urlencoded({ extended: false, limit: '4kb' }), wrap(async (req, res) => {
+  app.post('/interaction/:uid', loginLimiter, ownerLimiter, express.urlencoded({ extended: false, limit: '4kb' }), interactionRoute(async (req, res) => {
     if (req.headers.origin !== issuer) return res.status(403).send('Invalid form origin');
     const details = await provider.interactionDetails(req, res);
+    if (details.uid !== req.params.uid) return restartAuthorization(res);
     const entry = csrf.get(details.uid);
-    if (!entry || entry.expires < Date.now() || !same(req.body.csrf, entry.nonce)) return res.status(403).send('Invalid form; reopen the authorization page');
+    if (!entry || entry.expires < Date.now() || !same(req.body.csrf, entry.nonce)) return restartAuthorization(res, 403);
     csrf.delete(details.uid);
     if (req.body.decision === 'deny') return provider.interactionFinished(req, res, { error: 'access_denied' }, { mergeWithLastSubmission: false });
     if (req.body.decision !== 'allow') return res.status(400).send('Invalid decision');

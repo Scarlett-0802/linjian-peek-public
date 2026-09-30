@@ -4,7 +4,7 @@ import path from 'node:path';
 import { errors } from 'oidc-provider';
 
 // Single-instance adapter. OAuth state is runtime data, never source/configuration.
-// Render's ephemeral filesystem loses it on replacement; this safely requires relinking.
+// In Render, filename must reside on the configured persistent disk (see render.yaml).
 export function createOAuthStore(filename, namespace) {
   if (filename !== ':memory:') mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(filename);

@@ -8,7 +8,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import express from 'express';
-import { installAuth, readAuthConfig, MCP_SCOPE } from '../auth.js';
+import { installAuth, readAuthConfig, MCP_SCOPE, AUTHORIZATION_TTL } from '../auth.js';
 import { createOAuthStore } from '../oauth-store.js';
 
 // Ephemeral test-only credentials. None are printed or written into tracked files.
@@ -117,6 +117,105 @@ async function tokens(request = browser()) {
   }
   return response.json();
 }
+function refresh(token, request = browser()) {
+  const init = form({ grant_type: 'refresh_token', client_id: 'zhangxinchuang-chatgpt',
+    client_secret: env.MCP_CLIENT_SECRET, resource, refresh_token: token });
+  delete init.headers.origin;
+  return request('/token', init);
+}
+async function pendingForm(request) {
+  const { params } = authParams();
+  const start = await request(`/auth?${new URLSearchParams(params)}`);
+  const url = start.headers.get('location');
+  const page = await request(url);
+  const csrf = (await page.text()).match(/name="csrf" value="([^"]+)"/)[1];
+  return { url, init: form({ csrf, decision: 'allow', password: env.MCP_OWNER_SECRET }) };
+}
+
+test('Render configuration refuses an implicit or relative ephemeral database', () => {
+  for (const MCP_OAUTH_DB_PATH of ['', ':memory:', '.oauth-state/oauth.sqlite']) {
+    assert.throws(() => readAuthConfig({ ...env, RENDER: 'true', MCP_OAUTH_DB_PATH }));
+  }
+  assert.ok(readAuthConfig({ ...env, RENDER: 'true' }).storePath);
+});
+
+test('expired access and deleted owner Session do not prevent refresh', async () => {
+  const token = await tokens();
+  const rt = await auth.provider.RefreshToken.find(token.refresh_token);
+  assert.ok(!rt.expiresWithSession);
+  const session = await auth.provider.Session.findByUid(rt.sessionUid);
+  assert.ok(session);
+  await session.destroy();
+  const access = await auth.provider.AccessToken.adapter.find(token.access_token);
+  access.exp = 1;
+  await auth.provider.AccessToken.adapter.upsert(token.access_token, access, 600);
+  assert.equal((await browser()('/mcp', { headers: { authorization: `Bearer ${token.access_token}` } })).status, 401);
+  const response = await refresh(token.refresh_token);
+  assert.equal(response.status, 200);
+  const replacement = await response.json();
+  assert.equal((await browser()('/mcp', { headers: { authorization: `Bearer ${replacement.access_token}` } })).status, 200);
+});
+
+test('90-day absolute authorization survives Session expiry and rotation never extends it', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const token = await tokens();
+  const original = await auth.provider.RefreshToken.find(token.refresh_token);
+  const grant = await auth.provider.Grant.find(original.grantId);
+  assert.equal(grant.exp - grant.iat, AUTHORIZATION_TTL);
+  assert.ok(original.exp <= grant.exp);
+  t.mock.timers.tick(2 * 3600 * 1000);
+  assert.equal(await auth.provider.Session.findByUid(original.sessionUid), undefined);
+  let response = await refresh(token.refresh_token);
+  assert.equal(response.status, 200);
+  let current = await response.json();
+  t.mock.timers.tick(88 * 24 * 3600 * 1000);
+  response = await refresh(current.refresh_token);
+  assert.equal(response.status, 200);
+  current = await response.json();
+  const rotated = await auth.provider.RefreshToken.find(current.refresh_token);
+  assert.equal(rotated.iiat, original.iiat);
+  assert.ok(rotated.exp <= original.exp);
+  assert.ok(rotated.exp <= grant.exp);
+  t.mock.timers.tick(2 * 24 * 3600 * 1000);
+  assert.equal((await refresh(current.refresh_token)).status, 400);
+});
+
+test('independent Connector grants refresh independently; explicit revoke blocks only its grant', async () => {
+  const first = await tokens(), second = await tokens();
+  const a = await auth.provider.RefreshToken.find(first.refresh_token);
+  const b = await auth.provider.RefreshToken.find(second.refresh_token);
+  assert.notEqual(a.grantId, b.grantId);
+  await (await auth.provider.Grant.find(a.grantId)).destroy();
+  assert.equal((await refresh(first.refresh_token)).status, 400);
+  assert.equal((await refresh(second.refresh_token)).status, 200);
+});
+
+test('standard revocation endpoint revokes refresh authorization', async () => {
+  const token = await tokens();
+  const init = form({ client_id: 'zhangxinchuang-chatgpt', client_secret: env.MCP_CLIENT_SECRET,
+    token: token.refresh_token, token_type_hint: 'refresh_token' });
+  delete init.headers.origin;
+  assert.equal((await browser()('/token/revocation', init)).status, 200);
+  assert.equal((await refresh(token.refresh_token)).status, 400);
+  assert.equal((await browser()('/mcp', { headers: { authorization: `Bearer ${token.access_token}` } })).status, 401);
+});
+
+test('expired Interaction and missing or mismatched cookies show a safe restart prompt', async () => {
+  const request = browser();
+  const pending = await pendingForm(request);
+  const uid = pending.url.split('/').at(-1);
+  const interaction = await auth.provider.Interaction.adapter.find(uid);
+  assert.ok(interaction);
+  await auth.provider.Interaction.adapter.upsert(uid, interaction, -1);
+  for (const response of [await request(pending.url, pending.init), await browser()(pending.url)]) {
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /返回 ChatGPT 重新发起/);
+  }
+  const other = await pendingForm(request);
+  const response = await request(other.url + '-wrong', other.init);
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /返回 ChatGPT 重新发起/);
+});
 
 test('configuration fails closed and rejects unsafe URLs / reused credentials', () => {
   for (const change of [ { MCP_OWNER_SECRET: '' }, { MCP_PUBLIC_URL: 'http://example.test' },
@@ -292,7 +391,7 @@ async function launchRealServer(t, overrides = {}) {
     env: { ...process.env, ...env, MCP_OAUTH_DB_PATH: path.join(temp, `child-${port}.sqlite`), PORT: String(port), ...overrides }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   // Drain output without displaying credentials or request data even on a test failure.
   child.stdout.resume(); child.stderr.resume();
-  t.after(async () => { if (child.exitCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; } });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; } });
   const childBase = `http://127.0.0.1:${port}`;
   let ready = false;
   for (let i = 0; i < 100; i++) {
@@ -300,8 +399,37 @@ async function launchRealServer(t, overrides = {}) {
     await new Promise((resolve) => setTimeout(resolve, 30));
   }
   assert.ok(ready, 'Real MCP process must become ready');
-  return browser(() => childBase);
+  const request = browser(() => childBase);
+  request.base = childBase;
+  request.stop = async () => {
+    if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }
+  };
+  return request;
 }
+
+test('real process restart reopens SQLite: refresh survives, lost CSRF safely requires new authorization', async (t) => {
+  const database = path.join(temp, 'restart.sqlite');
+  let running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+  const request = browser(() => running.base);
+  const token = await tokens(running);
+  const pending = await pendingForm(request);
+  await running.stop();
+  running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+  const rejected = await request(pending.url, pending.init);
+  assert.equal(rejected.status, 403);
+  assert.match(await rejected.text(), /返回 ChatGPT 重新发起/);
+  const response = await refresh(token.refresh_token, running);
+  assert.equal(response.status, 200);
+  const replacement = await response.json();
+  assert.notEqual(replacement.refresh_token, token.refresh_token);
+  // A fresh browser can complete a new login and consent after the failed old form.
+  assert.ok((await tokens(running)).refresh_token);
+  // Consumed-token state also survives the next process restart.
+  await running.stop();
+  running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+  assert.equal((await refresh(token.refresh_token, running)).status, 400);
+  assert.equal((await refresh(replacement.refresh_token, running)).status, 400);
+});
 test('real MCP: OAuth -> initialize -> tools/list -> read-only tool; backend credential remains separate', async (t) => {
   let backendCalls = 0, badBackendCredential = false;
   const backend = createServer((req, res) => {
