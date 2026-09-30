@@ -2,8 +2,7 @@ import express from 'express';
 import Provider, { errors } from 'oidc-provider';
 import { rateLimit } from 'express-rate-limit';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import path from 'node:path';
-import { createOAuthStore } from './oauth-store.js';
+import { createOAuthStore, readStoreConfig, OAuthStorageError } from './oauth-store.js';
 
 export const MCP_SCOPE = 'phone:control';
 export const AUTHORIZATION_TTL = 90 * 24 * 60 * 60;
@@ -12,7 +11,12 @@ const CLIENT_ID = 'zhangxinchuang-chatgpt';
 const digest = (value) => createHash('sha256').update(value).digest();
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && timingSafeEqual(digest(a), digest(b));
 const escape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((error) => {
+  if (error instanceof OAuthStorageError && !res.headersSent) {
+    return res.status(503).json({ error: 'oauth_storage_unavailable' });
+  }
+  next(error);
+});
 
 export function readAuthConfig(env = process.env) {
   const issuer = new URL(env.MCP_PUBLIC_URL || env.RENDER_EXTERNAL_URL || '');
@@ -39,11 +43,8 @@ export function readAuthConfig(env = process.env) {
   if (!Array.isArray(jwks.keys) || !jwks.keys.length || jwks.keys.some((key) => !key.d || !key.kid)) {
     throw new Error('Configure a private signing JWKS');
   }
-  if (env.RENDER === 'true' && (!env.MCP_OAUTH_DB_PATH || !path.isAbsolute(env.MCP_OAUTH_DB_PATH) || env.MCP_OAUTH_DB_PATH === ':memory:')) {
-    throw new Error('Render requires an absolute OAuth database path on a persistent disk');
-  }
   return { issuer: issuer.origin, ownerSecret, cookieSecret, clientSecret, redirectUris, jwks,
-    storePath: env.MCP_OAUTH_DB_PATH || path.join(process.cwd(), '.oauth-state', 'oauth.sqlite') };
+    store: readStoreConfig(env) };
 }
 
 export function installAuth(app, config) {
@@ -53,7 +54,7 @@ export function installAuth(app, config) {
   const metadataUrl = `${issuer}/.well-known/oauth-protected-resource`;
   // Rotating any configured credential invalidates old grants, sessions and tokens.
   const namespace = digest(JSON.stringify([issuer, ownerSecret, cookieSecret, clientSecret, redirectUris, jwks])).toString('hex');
-  const store = createOAuthStore(config.storePath, namespace);
+  const store = createOAuthStore(config.store, namespace);
   const provider = new Provider(issuer, {
     adapter: store.adapter,
     clients: [{ client_id: CLIENT_ID, client_secret: clientSecret, client_name: 'ChatGPT · 掌心窗',

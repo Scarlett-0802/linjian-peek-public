@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import express from 'express';
 import { installAuth, readAuthConfig, MCP_SCOPE, AUTHORIZATION_TTL } from '../auth.js';
 import { createOAuthStore } from '../oauth-store.js';
+import { libsqlFixture } from './libsql-fixture.js';
 
 // Ephemeral test-only credentials. None are printed or written into tracked files.
 const secret = () => randomBytes(32).toString('base64url');
@@ -22,10 +23,12 @@ const redirectUri = 'https://chatgpt.com/connector_platform_oauth_redirect';
 const temp = mkdtempSync(path.join(os.tmpdir(), 'palm-oauth-test-'));
 const env = { MCP_PUBLIC_URL: issuer, MCP_OWNER_SECRET: secret(), MCP_COOKIE_SECRET: secret(), MCP_CLIENT_SECRET: secret(),
   MCP_OAUTH_JWKS: JSON.stringify({ keys: [key] }), MCP_OAUTH_REDIRECT_URIS: JSON.stringify([redirectUri]),
-  MCP_OAUTH_DB_PATH: path.join(temp, 'oauth.sqlite'), LINJIAN_TOKEN: secret() };
-let server, auth, base;
+  LINJIAN_TOKEN: secret() };
+let server, auth, base, database;
 
 before(async () => {
+  database = await libsqlFixture(path.join(temp, 'remote.sqlite'));
+  Object.assign(env, database.env);
   const app = express();
   app.set('trust proxy', 1);
   auth = installAuth(app, readAuthConfig(env));
@@ -35,7 +38,7 @@ before(async () => {
   base = `http://127.0.0.1:${server.address().port}`;
 });
 after(async () => {
-  await new Promise((resolve) => server?.close(resolve)); auth?.close();
+  await new Promise((resolve) => server?.close(resolve)); auth?.close(); await database?.close();
   assert.equal(path.dirname(path.resolve(temp)), path.resolve(os.tmpdir()));
   assert.ok(path.basename(temp).startsWith('palm-oauth-test-'));
   rmSync(temp, { recursive: true, force: true });
@@ -132,11 +135,15 @@ async function pendingForm(request) {
   return { url, init: form({ csrf, decision: 'allow', password: env.MCP_OWNER_SECRET }) };
 }
 
-test('Render configuration refuses an implicit or relative ephemeral database', () => {
-  for (const MCP_OAUTH_DB_PATH of ['', ':memory:', '.oauth-state/oauth.sqlite']) {
-    assert.throws(() => readAuthConfig({ ...env, RENDER: 'true', MCP_OAUTH_DB_PATH }));
+test('production requires remote TLS database and credential; no local or insecure fallback', () => {
+  for (const TURSO_DATABASE_URL of ['', ':memory:', 'file:oauth.sqlite', 'http://example.test',
+    'http://127.0.0.1:1234', 'libsql://example.test?tls=0', 'https://user:pass@example.test',
+    'https://example.test/?authToken=secret']) {
+    assert.throws(() => readAuthConfig({ ...env, RENDER: 'true', TURSO_DATABASE_URL }));
   }
-  assert.ok(readAuthConfig({ ...env, RENDER: 'true' }).storePath);
+  const production = { ...env, RENDER: 'true', TURSO_DATABASE_URL: 'libsql://example.turso.io' };
+  assert.equal(readAuthConfig(production).store.url, 'https://example.turso.io');
+  assert.throws(() => readAuthConfig({ ...production, TURSO_AUTH_TOKEN: '' }));
 });
 
 test('expired access and deleted owner Session do not prevent refresh', async () => {
@@ -154,6 +161,38 @@ test('expired access and deleted owner Session do not prevent refresh', async ()
   assert.equal(response.status, 200);
   const replacement = await response.json();
   assert.equal((await browser()('/mcp', { headers: { authorization: `Bearer ${replacement.access_token}` } })).status, 200);
+});
+
+test('database outage blocks protected tools and token issuance; recovery preserves authorization', async (t) => {
+  t.after(() => { database.state.mode = 'online'; });
+  const token = await tokens();
+  const request = browser();
+  database.state.mode = 'offline';
+  for (const route of ['/mcp', '/mcp-wallet', '/sse', '/messages']) {
+    const response = await request(route, { headers: { authorization: `Bearer ${token.access_token}` } });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: 'oauth_storage_unavailable' });
+  }
+  const failed = await refresh(token.refresh_token);
+  assert.ok(failed.status >= 500);
+  const body = await failed.text();
+  assert.ok(!body.includes(token.refresh_token));
+  assert.ok(!body.includes(env.TURSO_AUTH_TOKEN));
+  database.state.mode = 'online';
+  assert.equal((await refresh(token.refresh_token)).status, 200);
+});
+
+test('refresh acknowledgement loss issues no token; subsequent replay revokes grant', async (t) => {
+  t.after(() => { database.state.mode = 'online'; });
+  const token = await tokens();
+  const before = database.state.consumes;
+  database.state.mode = 'drop-after-consume';
+  const failed = await refresh(token.refresh_token);
+  assert.ok(failed.status >= 500);
+  assert.equal(database.state.consumes - before, 1);
+  database.state.mode = 'online';
+  assert.equal((await refresh(token.refresh_token)).status, 400);
+  assert.equal((await browser()('/mcp', { headers: { authorization: `Bearer ${token.access_token}` } })).status, 401);
 });
 
 test('90-day absolute authorization survives Session expiry and rotation never extends it', async (t) => {
@@ -332,8 +371,8 @@ test('missing CSRF, wrong owner secret, cross-origin POST and denial do not gran
     } else assert.equal(response.status, mode === 'password' ? 401 : 403);
   }
 });
-test('SQLite adapter atomically consumes once and enforces expiration and namespace isolation', async () => {
-  const store = createOAuthStore(':memory:', 'unit'); const adapter = new store.adapter('AuthorizationCode');
+test('Remote libSQL adapter atomically consumes once and enforces expiration and namespace isolation', async () => {
+  const store = createOAuthStore(database.config, 'unit'); const adapter = new store.adapter('AuthorizationCode');
   await adapter.upsert('code', { grantId: 'grant' }, 60);
   const results = await Promise.allSettled([adapter.consume('code'), adapter.consume('code')]);
   assert.equal(results.filter((x) => x.status === 'fulfilled').length, 1);
@@ -376,8 +415,8 @@ test('expired authorization codes cannot be exchanged', async () => {
   payload.exp = 1; await auth.provider.AuthorizationCode.adapter.upsert(code.code, payload, 60);
   assert.equal((await exchange(code)).status, 400);
 });
-test('SQLite state survives reopening but never crosses configuration namespaces', async () => {
-  const filename = path.join(temp, 'persistence.sqlite');
+test('Remote state survives client reopening but never crosses configuration namespaces', async () => {
+  const filename = database.config;
   let store = createOAuthStore(filename, 'first');
   await new store.adapter('AccessToken').upsert('fixture', { grantId: 'test-grant' }, 60); store.close();
   store = createOAuthStore(filename, 'first'); assert.ok(await new store.adapter('AccessToken').find('fixture')); store.close();
@@ -388,7 +427,7 @@ async function launchRealServer(t, overrides = {}) {
   const portHolder = createServer(); portHolder.listen(0, '127.0.0.1'); await once(portHolder, 'listening');
   const port = portHolder.address().port; await new Promise((resolve) => portHolder.close(resolve));
   const child = spawn(process.execPath, ['server.js'], { cwd: path.resolve(import.meta.dirname, '..'),
-    env: { ...process.env, ...env, MCP_OAUTH_DB_PATH: path.join(temp, `child-${port}.sqlite`), PORT: String(port), ...overrides }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    env: { ...process.env, ...env, PORT: String(port), ...overrides }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   // Drain output without displaying credentials or request data even on a test failure.
   child.stdout.resume(); child.stderr.resume();
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; } });
@@ -407,14 +446,14 @@ async function launchRealServer(t, overrides = {}) {
   return request;
 }
 
-test('real process restart reopens SQLite: refresh survives, lost CSRF safely requires new authorization', async (t) => {
-  const database = path.join(temp, 'restart.sqlite');
-  let running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+test('real process restart reconnects to remote libSQL: refresh survives, lost CSRF safely requires new authorization', async (t) => {
+  // Remote test database stays alive while MCP processes are replaced.
+  let running = await launchRealServer(t);
   const request = browser(() => running.base);
   const token = await tokens(running);
   const pending = await pendingForm(request);
   await running.stop();
-  running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+  running = await launchRealServer(t);
   const rejected = await request(pending.url, pending.init);
   assert.equal(rejected.status, 403);
   assert.match(await rejected.text(), /返回 ChatGPT 重新发起/);
@@ -426,7 +465,7 @@ test('real process restart reopens SQLite: refresh survives, lost CSRF safely re
   assert.ok((await tokens(running)).refresh_token);
   // Consumed-token state also survives the next process restart.
   await running.stop();
-  running = await launchRealServer(t, { MCP_OAUTH_DB_PATH: database });
+  running = await launchRealServer(t);
   assert.equal((await refresh(token.refresh_token, running)).status, 400);
   assert.equal((await refresh(replacement.refresh_token, running)).status, 400);
 });

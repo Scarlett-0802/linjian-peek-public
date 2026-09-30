@@ -35,12 +35,7 @@ services:
   - type: web
     name: zhangxinchuang-mcp
     runtime: node
-    # Paid resources: review costs before syncing this Blueprint.
-    plan: starter
-    disk:
-      name: mcp-oauth-state
-      mountPath: /var/data/mcp-oauth
-      sizeGB: 1
+    plan: free
     rootDir: mcp
     buildCommand: npx --yes pnpm@11.19.0 install --frozen-lockfile --ignore-scripts
     startCommand: npm start
@@ -49,8 +44,10 @@ services:
         value: 24.19.0
       - key: NODE_ENV
         value: production
-      - key: MCP_OAUTH_DB_PATH
-        value: /var/data/mcp-oauth/oauth.sqlite
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       # 以下 Secret 仅属于 MCP；不放入与 Python Server 共享的环境变量组。
       - key: MCP_OWNER_SECRET
         generateValue: true
