@@ -176,13 +176,56 @@ test('browser Path cookies survive login -> resume -> new consent, with stale in
   assert.ok(records.some((r) => r.stage === 'consent_details_ok' && r.session_exists === true));
   const allowed = ['process_start_id', 'process_started_at', 'stage', 'uid_fp', 'prompt',
     'session_exists', 'grant_exists', 'error_class', 'restart', 'reason'].sort();
-  for (const r of records) {
+  const authorizationStages = new Set(['authorization_request_enter',
+    'authorization_interaction_created', 'authorization_response']);
+  for (const r of records.filter((record) => !authorizationStages.has(record.stage))) {
     assert.deepEqual(Object.keys(r).sort(), allowed);
     assert.ok(r.uid_fp === null || /^[a-f0-9]{16}$/.test(r.uid_fp));
   }
   const serialized = JSON.stringify(records);
   for (const forbidden of [consentUid, session.uid, csrf, env.MCP_OWNER_SECRET, env.MCP_CLIENT_SECRET,
     env.MCP_COOKIE_SECRET, env.TURSO_AUTH_TOKEN, login.url]) assert.ok(!serialized.includes(forbidden));
+});
+
+test('authorization redirect diagnostics expose only bounded request and response metadata', async (t) => {
+  const log = t.mock.method(console, 'info', () => {});
+  const request = browser();
+  const { params } = authParams();
+  const rawUserAgent = 'Mozilla/5.0 diagnostic-secret Chrome/150.0.0.0 Safari/537.36';
+  const rawState = params.state;
+  const response = await request(`/auth?${new URLSearchParams(params)}`, {
+    headers: { 'user-agent': rawUserAgent },
+  });
+  assert.equal(response.status, 303);
+
+  const records = log.mock.calls.map((call) => JSON.parse(call.arguments[1]));
+  const entered = records.find((record) => record.stage === 'authorization_request_enter');
+  assert.deepEqual({
+    client: entered.client_id_matches, host: entered.redirect_host, path: entered.redirect_path,
+    responseType: entered.response_type, pkce: entered.pkce_method, scope: entered.scope, ua: entered.user_agent,
+  }, { client: true, host: 'chatgpt.com', path: '/connector_platform_oauth_redirect',
+    responseType: 'code', pkce: 'S256', scope: MCP_SCOPE, ua: 'chromium' });
+
+  const created = records.find((record) => record.stage === 'authorization_interaction_created');
+  assert.equal(created.prompt, 'login');
+  assert.match(created.uid_fp, /^[a-f0-9]{16}$/);
+  const completed = records.find((record) => record.stage === 'authorization_response');
+  assert.equal(completed.status_code, 303);
+  assert.equal(completed.location_origin, issuer);
+  assert.equal(completed.location_path, '/interaction/{redacted}');
+  assert.equal(completed.interaction_redirect, true);
+  assert.equal(completed.uid_fp, created.uid_fp);
+  assert.equal(completed.user_agent, 'chromium');
+
+  const serialized = JSON.stringify(records);
+  for (const forbidden of [rawUserAgent, rawState, params.code_challenge, response.headers.get('location')]) {
+    assert.ok(!serialized.includes(forbidden));
+  }
+  for (const record of records.filter((item) => item.stage.startsWith('authorization_'))) {
+    assert.deepEqual(Object.keys(record).sort(), ['client_id_matches', 'interaction_redirect', 'location_origin',
+      'location_path', 'pkce_method', 'process_start_id', 'process_started_at', 'prompt', 'redirect_host',
+      'redirect_path', 'response_type', 'scope', 'stage', 'status_code', 'uid_fp', 'user_agent'].sort());
+  }
 });
 
 test('OAuth browser navigation CSP permits only self and the ChatGPT callback origin', async () => {

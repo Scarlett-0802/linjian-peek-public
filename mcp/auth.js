@@ -14,6 +14,8 @@ const diagnosticStages = new Set(['process_start', 'interaction_get_enter', 'int
   'login_post_details_ok', 'password_verified', 'login_finished_before', 'login_finished_after',
   'consent_get_enter', 'consent_details_ok', 'provider_interaction_started', 'provider_interaction_ended',
   'provider_authorization_error', 'restart_authorization']);
+const authorizationDiagnosticStages = new Set(['authorization_request_enter',
+  'authorization_interaction_created', 'authorization_response']);
 const diagnosticReasons = new Set(['session_not_found', 'uid_mismatch', 'csrf_missing', 'csrf_expired', 'csrf_mismatch']);
 const diagnosticPrompts = new Map();
 const uidFingerprint = (uid) => typeof uid === 'string'
@@ -82,6 +84,41 @@ export function installAuth(app, config) {
   // One canonical resource covers both MCP tool sets. Never derive it from a request Host header.
   const resource = `${issuer}/mcp`;
   const metadataUrl = `${issuer}/.well-known/oauth-protected-resource`;
+  const queryValue = (value) => typeof value === 'string' ? value : null;
+  const userAgentFamily = (value) => {
+    if (typeof value !== 'string') return 'unknown';
+    const ua = value.toLowerCase();
+    if (/(chrom|crios|edg|opr)/.test(ua)) return 'chromium';
+    if (/(firefox|fxios)/.test(ua)) return 'firefox';
+    if (/safari/.test(ua)) return 'safari';
+    return 'unknown';
+  };
+  const safeUrlParts = (value, base = undefined) => {
+    if (typeof value !== 'string' || value.length > 2048) return null;
+    try {
+      const url = base ? new URL(value, base) : new URL(value);
+      if (url.username || url.password || !['https:', 'http:'].includes(url.protocol)) return null;
+      return { origin: url.origin, host: url.host, path: url.pathname };
+    } catch { return null; }
+  };
+  const authorizationDiagnostic = (stage, data = {}) => {
+    try {
+      if (!authorizationDiagnosticStages.has(stage)) return;
+      const responseType = data.responseType === 'code' ? 'code' : data.responseType ? 'other' : null;
+      const pkceMethod = data.pkceMethod === 'S256' ? 'S256' : data.pkceMethod ? 'other' : null;
+      const scope = data.scope === MCP_SCOPE ? MCP_SCOPE : data.scope ? 'other' : null;
+      console.info('[oauth_browser]', JSON.stringify({ ...diagnosticBoot, stage,
+        uid_fp: uidFingerprint(data.uid), prompt: data.prompt === 'login' ? 'login' : 'unknown',
+        client_id_matches: typeof data.clientMatches === 'boolean' ? data.clientMatches : 'unknown',
+        redirect_host: data.redirect?.host || null, redirect_path: data.redirect?.path || null,
+        response_type: responseType, pkce_method: pkceMethod, scope,
+        user_agent: ['chromium', 'safari', 'firefox'].includes(data.userAgent) ? data.userAgent : 'unknown',
+        status_code: Number.isInteger(data.statusCode) ? data.statusCode : null,
+        location_origin: data.location?.origin || null, location_path: data.location?.path || null,
+        interaction_redirect: typeof data.interactionRedirect === 'boolean' ? data.interactionRedirect : 'unknown',
+      }));
+    } catch { /* Diagnostics must never change authorization behavior. */ }
+  };
   // Rotating any configured credential invalidates old grants, sessions and tokens.
   const namespace = digest(JSON.stringify([issuer, ownerSecret, cookieSecret, clientSecret, redirectUris, jwks])).toString('hex');
   const store = createOAuthStore(config.store, namespace);
@@ -137,6 +174,9 @@ export function installAuth(app, config) {
         diagnosticPrompts.set(uidFp, interaction.prompt.name);
       }
       diagnostic(stage, interaction?.uid, interaction, { error: event === 'authorization.error' ? error : undefined });
+      if (event === 'interaction.started' && interaction?.prompt?.name === 'login') {
+        authorizationDiagnostic('authorization_interaction_created', { uid: interaction.uid, prompt: 'login' });
+      }
       if (event === 'interaction.ended' && uidFp) diagnosticPrompts.delete(uidFp);
     });
   }
@@ -160,6 +200,25 @@ export function installAuth(app, config) {
   });
 
   app.use((req, res, next) => {
+    if (req.method === 'GET' && req.path === '/auth') {
+      const redirect = safeUrlParts(queryValue(req.query.redirect_uri));
+      authorizationDiagnostic('authorization_request_enter', {
+        clientMatches: queryValue(req.query.client_id) === CLIENT_ID, redirect,
+        responseType: queryValue(req.query.response_type), pkceMethod: queryValue(req.query.code_challenge_method),
+        scope: queryValue(req.query.scope), userAgent: userAgentFamily(req.headers['user-agent']),
+      });
+      res.once('finish', () => {
+        const rawLocation = res.getHeader('location');
+        const location = safeUrlParts(typeof rawLocation === 'string' ? rawLocation : null, issuer);
+        const interactionMatch = location?.origin === issuer && location.path.match(/^\/interaction\/([^/]+)$/);
+        authorizationDiagnostic('authorization_response', {
+          uid: interactionMatch?.[1], statusCode: res.statusCode,
+          location: location && { ...location, path: interactionMatch ? '/interaction/{redacted}' : location.path },
+          interactionRedirect: !!interactionMatch,
+          userAgent: userAgentFamily(req.headers['user-agent']),
+        });
+      });
+    }
     const oauthBrowserNavigation = req.path === '/auth' || req.path.startsWith('/auth/') ||
       req.path.startsWith('/interaction/');
     const formAction = oauthBrowserNavigation
