@@ -11,6 +11,7 @@ import express from 'express';
 import { installAuth, readAuthConfig, MCP_SCOPE, AUTHORIZATION_TTL } from '../auth.js';
 import { createOAuthStore } from '../oauth-store.js';
 import { libsqlFixture } from './libsql-fixture.js';
+import { BrowserCookieJar } from './browser-cookie-jar.js';
 
 // Ephemeral test-only credentials. None are printed or written into tracked files.
 const secret = () => randomBytes(32).toString('base64url');
@@ -45,12 +46,12 @@ after(async () => {
 });
 
 function browser(targetBase = () => base) {
-  const cookies = new Map();
-  return async (url, init = {}) => {
+  const cookies = new BrowserCookieJar();
+  const request = async (url, init = {}) => {
     const logical = new URL(url, issuer);
     assert.equal(logical.origin, issuer, 'Tests must never call an external service');
     const headers = { host: new URL(issuer).host, 'x-forwarded-proto': 'https', ...init.headers };
-    const cookie = [...cookies].filter(([, c]) => logical.pathname.startsWith(c.path)).map(([name, c]) => `${name}=${c.value}`).join('; ');
+    const cookie = await cookies.header(logical.href, { method: init.method || 'GET', ...init.navigation });
     if (cookie) headers.cookie = cookie;
     const response = await new Promise((resolve, reject) => {
       const req = httpRequest(`${targetBase()}${logical.pathname}${logical.search}`, { method: init.method || 'GET', headers }, (res) => {
@@ -62,14 +63,11 @@ function browser(targetBase = () => base) {
       });
       req.on('error', reject); req.end(init.body?.toString());
     });
-    for (const line of response.headers.getSetCookie()) {
-      const [pair, ...attrs] = line.split(';'); const pos = pair.indexOf('=');
-      const name = pair.slice(0, pos), value = pair.slice(pos + 1);
-      const cookiePath = attrs.find((x) => x.trim().toLowerCase().startsWith('path='))?.trim().slice(5) || '/';
-      cookies.set(name, { value, path: cookiePath });
-    }
+    await cookies.store(logical.href, response.headers.getSetCookie());
     return response;
   };
+  request.cookies = cookies;
+  return request;
 }
 const form = (values) => ({ method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin: issuer }, body: new URLSearchParams(values) });
 function authParams(extra = {}) {
@@ -134,6 +132,77 @@ async function pendingForm(request) {
   const csrf = (await page.text()).match(/name="csrf" value="([^"]+)"/)[1];
   return { url, init: form({ csrf, decision: 'allow', password: env.MCP_OWNER_SECRET }) };
 }
+
+test('browser Path cookies survive login -> resume -> new consent, with stale interaction cookies retained', async (t) => {
+  const log = t.mock.method(console, 'info', () => {});
+  const request = browser();
+  const old = await pendingForm(request);
+  await request.cookies.store(issuer, ['_interaction=stale-root; Path=/; Secure; SameSite=Lax']);
+  const login = await pendingForm(request);
+  assert.notEqual(login.url, old.url);
+  const posted = await request(login.url, login.init);
+  assert.equal(posted.status, 303);
+  const resumed = await request(posted.headers.get('location'));
+  assert.equal(resumed.status, 303);
+  const consentUrl = resumed.headers.get('location');
+  const consentUid = new URL(consentUrl, issuer).pathname.split('/').at(-1);
+  assert.notEqual(consentUrl, login.url);
+  assert.ok(resumed.headers.getSetCookie().some((line) => line.startsWith('_session=')));
+  assert.ok((await request.cookies.header(new URL(consentUrl, issuer).href)).includes('_session='));
+  assert.ok((await request.cookies.header(new URL(old.url, issuer).href)).includes('_interaction='));
+  const interaction = await auth.provider.Interaction.find(consentUid);
+  assert.equal(interaction.prompt.name, 'consent');
+  const session = await auth.provider.Session.findByUid(interaction.session.uid);
+  assert.ok(session);
+  assert.equal(session.accountId, 'owner');
+  assert.equal(session.transient, true, 'remember:false remains unchanged');
+  const page = await request(consentUrl);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.ok(!html.includes('name="password"'));
+  const csrf = html.match(/name="csrf" value="([^"]+)"/)[1];
+  const completed = await request(consentUrl, form({ csrf, decision: 'allow' }));
+  assert.equal(completed.status, 303);
+  const callback = await request(completed.headers.get('location'));
+  assert.equal(new URL(callback.headers.get('location')).origin, 'https://chatgpt.com');
+  const records = log.mock.calls.map(({ arguments: args }) => {
+    assert.equal(args[0], '[oauth_browser]'); return JSON.parse(args[1]);
+  });
+  for (const stage of ['interaction_get_enter', 'interaction_post_enter', 'login_post_details_ok',
+    'password_verified', 'login_finished_before', 'login_finished_after', 'provider_interaction_ended',
+    'provider_interaction_started', 'consent_get_enter', 'consent_details_ok']) {
+    assert.ok(records.some((r) => r.stage === stage), stage);
+  }
+  assert.ok(records.some((r) => r.stage === 'consent_details_ok' && r.session_exists === true));
+  const allowed = ['process_start_id', 'process_started_at', 'stage', 'uid_fp', 'prompt',
+    'session_exists', 'grant_exists', 'error_class', 'restart', 'reason'].sort();
+  for (const r of records) {
+    assert.deepEqual(Object.keys(r).sort(), allowed);
+    assert.ok(r.uid_fp === null || /^[a-f0-9]{16}$/.test(r.uid_fp));
+  }
+  const serialized = JSON.stringify(records);
+  for (const forbidden of [consentUid, session.uid, csrf, env.MCP_OWNER_SECRET, env.MCP_CLIENT_SECRET,
+    env.MCP_COOKIE_SECRET, env.TURSO_AUTH_TOKEN, login.url]) assert.ok(!serialized.includes(forbidden));
+});
+
+test('diagnostics distinguish UID mismatch and SessionNotFound without logging error details', async (t) => {
+  const log = t.mock.method(console, 'info', () => {});
+  const request = browser();
+  const login = await pendingForm(request);
+  // A subpath matches the real cookie path but is not the stored interaction UID.
+  const mismatch = await request(login.url + '-wrong', { headers: {
+    cookie: await request.cookies.header(new URL(login.url, issuer).href),
+  } });
+  assert.equal(mismatch.status, 400);
+  const missing = await browser()(login.url);
+  assert.equal(missing.status, 400);
+  const badCsrf = await request(login.url, form({ csrf: 'wrong', decision: 'allow', password: env.MCP_OWNER_SECRET }));
+  assert.equal(badCsrf.status, 403);
+  const records = log.mock.calls.map((call) => JSON.parse(call.arguments[1]));
+  assert.ok(records.some((r) => r.restart && r.reason === 'uid_mismatch'));
+  assert.ok(records.some((r) => r.restart && r.reason === 'session_not_found' && r.error_class === 'SessionNotFound'));
+  assert.ok(records.some((r) => r.restart && r.reason === 'csrf_mismatch'));
+});
 
 test('production requires remote TLS database and credential; no local or insecure fallback', () => {
   for (const TURSO_DATABASE_URL of ['', ':memory:', 'file:oauth.sqlite', 'http://example.test',

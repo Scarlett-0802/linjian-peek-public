@@ -8,6 +8,36 @@ export const MCP_SCOPE = 'phone:control';
 export const AUTHORIZATION_TTL = 90 * 24 * 60 * 60;
 const OWNER = 'owner';
 const CLIENT_ID = 'zhangxinchuang-chatgpt';
+const diagnosticBoot = { process_start_id: randomBytes(8).toString('hex'), process_started_at: new Date().toISOString() };
+const diagnosticStages = new Set(['process_start', 'interaction_get_enter', 'interaction_post_enter',
+  'interaction_details_ok', 'interaction_details_failed', 'interaction_finished_failed',
+  'login_post_details_ok', 'password_verified', 'login_finished_before', 'login_finished_after',
+  'consent_get_enter', 'consent_details_ok', 'provider_interaction_started', 'provider_interaction_ended',
+  'provider_authorization_error', 'restart_authorization']);
+const diagnosticReasons = new Set(['session_not_found', 'uid_mismatch', 'csrf_missing', 'csrf_expired', 'csrf_mismatch']);
+const diagnosticPrompts = new Map();
+const uidFingerprint = (uid) => typeof uid === 'string'
+  ? createHash('sha256').update(uid).digest('hex').slice(0, 16) : null;
+// Strict whitelist: never serialize request, provider objects, errors or their messages.
+function diagnostic(stage, uid, details, { error, reason, session = 'unknown', grant = 'unknown' } = {}) {
+  try {
+    if (!diagnosticStages.has(stage)) return;
+    const uidFp = uidFingerprint(uid);
+    const prompt = ['login', 'consent'].includes(details?.prompt?.name)
+      ? details.prompt.name : diagnosticPrompts.get(uidFp) || 'unknown';
+    const candidateErrorClass = error?.constructor?.name;
+    const errorClass = typeof candidateErrorClass === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(candidateErrorClass)
+      ? candidateErrorClass : error ? 'Error' : null;
+    console.info('[oauth_browser]', JSON.stringify({ ...diagnosticBoot, stage,
+      uid_fp: uidFp, prompt,
+      session_exists: typeof session === 'boolean' ? session : 'unknown',
+      grant_exists: typeof grant === 'boolean' ? grant : 'unknown',
+      error_class: errorClass,
+      restart: stage === 'restart_authorization', reason: diagnosticReasons.has(reason) ? reason : null,
+    }));
+  } catch { /* Diagnostics must never change authorization behavior. */ }
+}
+diagnostic('process_start');
 const digest = (value) => createHash('sha256').update(value).digest();
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && timingSafeEqual(digest(a), digest(b));
 const escape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -97,6 +127,19 @@ export function installAuth(app, config) {
   provider.proxy = true; // Render terminates HTTPS before forwarding to this process.
   // Do not log provider error objects: they may contain request or credential details.
   provider.on('server_error', () => console.error('OAuth server error'));
+  for (const [event, stage] of [['interaction.started', 'provider_interaction_started'],
+    ['interaction.ended', 'provider_interaction_ended'], ['authorization.error', 'provider_authorization_error']]) {
+    provider.on(event, (ctx, error) => {
+      const interaction = ctx?.oidc?.entities?.Interaction;
+      const uidFp = uidFingerprint(interaction?.uid);
+      if (event === 'interaction.started' && uidFp && ['login', 'consent'].includes(interaction?.prompt?.name)) {
+        if (diagnosticPrompts.size >= 1000) diagnosticPrompts.clear();
+        diagnosticPrompts.set(uidFp, interaction.prompt.name);
+      }
+      diagnostic(stage, interaction?.uid, interaction, { error: event === 'authorization.error' ? error : undefined });
+      if (event === 'interaction.ended' && uidFp) diagnosticPrompts.delete(uidFp);
+    });
+  }
 
   const challenge = (res, status = 401) => res.status(status).set({
     'WWW-Authenticate': `Bearer resource_metadata="${metadataUrl}", scope="${MCP_SCOPE}"`,
@@ -137,21 +180,45 @@ export function installAuth(app, config) {
   const ownerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, skipSuccessfulRequests: true, keyGenerator: () => OWNER,
     standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'too_many_login_attempts' } });
   const csrf = new Map();
-  const restartAuthorization = (res, status = 400) => res.status(status).type('html').send(
+  const restartAuthorization = (res, state, reason, status = 400, error) => {
+    diagnostic('restart_authorization', state.uid, state.details, { ...state, reason, error });
+    return res.status(status).type('html').send(
     '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>请重新授权</title>' +
     '<h1>授权页面已失效</h1><p>页面已过期、浏览器会话不匹配或服务刚刚重启。' +
     '请关闭此页，返回 ChatGPT 重新发起掌心窗连接授权。不要重复提交旧表单。</p></html>');
+  };
   const interactionRoute = (fn) => wrap(async (req, res) => {
-    try { await fn(req, res); }
+    const state = { uid: req.params.uid, details: undefined, phase: 'interaction_details_failed' };
+    diagnostic(req.method === 'GET' ? 'interaction_get_enter' : 'interaction_post_enter', state.uid);
+    if (req.method === 'GET' && diagnosticPrompts.get(uidFingerprint(state.uid)) === 'consent') {
+      diagnostic('consent_get_enter', state.uid);
+    }
+    try { await fn(req, res, state); }
     catch (error) {
-      if (error instanceof errors.SessionNotFound) return restartAuthorization(res);
+      diagnostic(state.phase, state.uid, state.details, { ...state, error });
+      if (error instanceof errors.SessionNotFound) return restartAuthorization(res, state, 'session_not_found', 400, error);
       throw error;
     }
   });
-  const prune = () => { for (const [key, value] of csrf) if (value.expires < Date.now()) csrf.delete(key); };
-  app.get('/interaction/:uid', interactionRoute(async (req, res) => {
+  const interactionDetails = async (req, res, state) => {
     const details = await provider.interactionDetails(req, res);
-    if (details.uid !== req.params.uid) return restartAuthorization(res);
+    state.details = details;
+    // interactionDetails verified a referenced Session via findByUid. Grant IDs
+    // alone do not establish existence; do not add DB reads just for logging.
+    state.session = !!details.session?.uid;
+    state.grant = details.grantId ? 'unknown' : false;
+    state.phase = 'interaction_finished_failed';
+    diagnostic('interaction_details_ok', state.uid, details, state);
+    if (details.prompt.name === 'login' && req.method === 'POST') diagnostic('login_post_details_ok', state.uid, details, state);
+    if (details.prompt.name === 'consent') {
+      diagnostic('consent_details_ok', state.uid, details, state);
+    }
+    return details;
+  };
+  const prune = () => { for (const [key, value] of csrf) if (value.expires < Date.now()) csrf.delete(key); };
+  app.get('/interaction/:uid', interactionRoute(async (req, res, state) => {
+    const details = await interactionDetails(req, res, state);
+    if (details.uid !== req.params.uid) return restartAuthorization(res, state, 'uid_mismatch');
     if (!['login', 'consent'].includes(details.prompt.name)) return res.status(400).send('Unsupported authorization request');
     prune();
     if (csrf.size >= 1000) return res.status(503).send('Please try again later');
@@ -167,18 +234,25 @@ export function installAuth(app, config) {
       ${login ? '<label>掌心窗专用登录密钥（不是手机 Token）<input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>' : '<p>你已登录为设备主人。</p>'}
       <button name="decision" value="allow">${login ? '登录并继续' : '允许访问'}</button><button name="decision" value="deny" formnovalidate>取消</button></form></html>`);
   }));
-  app.post('/interaction/:uid', loginLimiter, ownerLimiter, express.urlencoded({ extended: false, limit: '4kb' }), interactionRoute(async (req, res) => {
+  app.post('/interaction/:uid', loginLimiter, ownerLimiter, express.urlencoded({ extended: false, limit: '4kb' }), interactionRoute(async (req, res, state) => {
     if (req.headers.origin !== issuer) return res.status(403).send('Invalid form origin');
-    const details = await provider.interactionDetails(req, res);
-    if (details.uid !== req.params.uid) return restartAuthorization(res);
+    const details = await interactionDetails(req, res, state);
+    if (details.uid !== req.params.uid) return restartAuthorization(res, state, 'uid_mismatch');
     const entry = csrf.get(details.uid);
-    if (!entry || entry.expires < Date.now() || !same(req.body.csrf, entry.nonce)) return restartAuthorization(res, 403);
+    if (!entry || entry.expires < Date.now() || !same(req.body.csrf, entry.nonce)) {
+      const reason = !entry || !req.body.csrf ? 'csrf_missing' : entry.expires < Date.now() ? 'csrf_expired' : 'csrf_mismatch';
+      return restartAuthorization(res, state, reason, 403);
+    }
     csrf.delete(details.uid);
     if (req.body.decision === 'deny') return provider.interactionFinished(req, res, { error: 'access_denied' }, { mergeWithLastSubmission: false });
     if (req.body.decision !== 'allow') return res.status(400).send('Invalid decision');
     if (details.prompt.name === 'login') {
       if (!same(req.body.password, ownerSecret)) return res.status(401).send('Login failed. Reopen the authorization page to retry.');
-      return provider.interactionFinished(req, res, { login: { accountId: OWNER, remember: false } }, { mergeWithLastSubmission: false });
+      diagnostic('password_verified', state.uid, details, state);
+      diagnostic('login_finished_before', state.uid, details, state);
+      const result = await provider.interactionFinished(req, res, { login: { accountId: OWNER, remember: false } }, { mergeWithLastSubmission: false });
+      diagnostic('login_finished_after', state.uid, details, state);
+      return result;
     }
     if (details.prompt.name !== 'consent' || details.session?.accountId !== OWNER || details.params.client_id !== CLIENT_ID) return res.status(403).send('Authorization denied');
     const grant = details.grantId ? await provider.Grant.find(details.grantId) : new provider.Grant({ accountId: OWNER, clientId: CLIENT_ID });
