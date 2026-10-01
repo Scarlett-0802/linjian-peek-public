@@ -185,6 +185,23 @@ test('browser Path cookies survive login -> resume -> new consent, with stale in
     env.MCP_COOKIE_SECRET, env.TURSO_AUTH_TOKEN, login.url]) assert.ok(!serialized.includes(forbidden));
 });
 
+test('OAuth browser navigation CSP permits only self and the ChatGPT callback origin', async () => {
+  const request = browser();
+  const { params } = authParams();
+  const start = await request(`/auth?${new URLSearchParams(params)}`);
+  const page = await request(start.headers.get('location'));
+  const expected = "default-src 'none'; form-action 'self' https://chatgpt.com; frame-ancestors 'none'; base-uri 'none'";
+  assert.equal(start.headers.get('content-security-policy'), expected);
+  const csp = page.headers.get('content-security-policy');
+  assert.equal(csp, expected);
+  assert.ok(!csp.includes('*'));
+  assert.ok(!csp.split(/\s+/).includes('https:'));
+
+  const metadata = await request('/.well-known/oauth-protected-resource');
+  assert.equal(metadata.headers.get('content-security-policy'),
+    "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+});
+
 test('diagnostics distinguish UID mismatch and SessionNotFound without logging error details', async (t) => {
   const log = t.mock.method(console, 'info', () => {});
   const request = browser();

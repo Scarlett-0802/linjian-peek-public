@@ -160,8 +160,13 @@ export function installAuth(app, config) {
   });
 
   app.use((req, res, next) => {
+    const oauthBrowserNavigation = req.path === '/auth' || req.path.startsWith('/auth/') ||
+      req.path.startsWith('/interaction/');
+    const formAction = oauthBrowserNavigation
+      ? "form-action 'self' https://chatgpt.com"
+      : "form-action 'self'";
     res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
-      'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
+      'Content-Security-Policy': `default-src 'none'; ${formAction}; frame-ancestors 'none'; base-uri 'none'` });
     if (req.headers.host !== new URL(issuer).host || !req.secure) return res.status(400).json({ error: 'invalid_origin' });
     req.headers['x-forwarded-host'] = new URL(issuer).host;
     next();
